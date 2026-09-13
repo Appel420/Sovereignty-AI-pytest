@@ -1,0 +1,114 @@
+name: Sovereignty PQC Payload
+
+on:
+  push:
+    branches:
+      - main
+      - 'ci/**'
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  pqc-payload:
+    name: ML-DSA-87 payload attestation
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      PQC_PRIVATE_KEY: ${{ secrets.SOVEREIGN_MLDSA87_PRIVATE_KEY }}
+      PQC_CONTEXT: sovereignty-ai-payload-v1
+    steps:
+      - name: Checkout exact revision
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Require OpenSSL ML-DSA support
+        shell: bash
+        run: |
+          set -euo pipefail
+          openssl version
+          openssl list -signature-algorithms | grep -E '^ML-DSA-(44|65|87)$' >/dev/null || {
+            echo 'FAIL: runner OpenSSL does not expose ML-DSA.' >&2
+            exit 1
+          }
+          [[ -n "${PQC_PRIVATE_KEY:-}" ]] || {
+            echo 'FAIL: SOVEREIGN_MLDSA87_PRIVATE_KEY is not provisioned.' >&2
+            exit 1
+          }
+
+      - name: Build canonical payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          import subprocess
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          revision = subprocess.check_output(
+              ["git", "rev-parse", "HEAD"], text=True
+          ).strip()
+          payload = {
+              "event_type": "sovereignty_pqc_payload",
+              "event_version": 1,
+              "algorithm": "ML-DSA-87",
+              "context": os.environ["PQC_CONTEXT"],
+              "who": os.environ["GITHUB_ACTOR"],
+              "what": "attest exact repository revision",
+              "when": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+              "where": {
+                  "repository": os.environ["GITHUB_REPOSITORY"],
+                  "ref": os.environ["GITHUB_REF"],
+                  "revision": revision,
+              },
+              "why": "owner-visible post-quantum payload integrity and signer proof",
+              "how": "OpenSSL ML-DSA-87 raw-message signature",
+              "authorization": "SOVEREIGN_MLDSA87_PRIVATE_KEY secret required",
+              "memory_loaded": False,
+              "network_accessed": True,
+          }
+          canonical = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+          payload["payload_sha256"] = hashlib.sha256(canonical).hexdigest()
+          Path("sovereignty-pqc-payload.json").write_text(
+              json.dumps(payload, sort_keys=True, indent=2) + "\n", encoding="utf-8"
+          )
+          PY
+
+      - name: Sign payload with ML-DSA-87
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          printf '%s\n' "$PQC_PRIVATE_KEY" > mldsa87-private.pem
+          openssl pkey -in mldsa87-private.pem -pubout -out mldsa87-public.pem
+          openssl pkeyutl -sign \
+            -in sovereignty-pqc-payload.json \
+            -inkey mldsa87-private.pem \
+            -out sovereignty-pqc-payload.sig \
+            -pkeyopt "context-string:${PQC_CONTEXT}"
+          openssl pkeyutl -verify \
+            -in sovereignty-pqc-payload.json \
+            -inkey mldsa87-public.pem \
+            -pubin \
+            -sigfile sovereignty-pqc-payload.sig \
+            -pkeyopt "context-string:${PQC_CONTEXT}"
+          sha256sum sovereignty-pqc-payload.json sovereignty-pqc-payload.sig mldsa87-public.pem
+          rm -f mldsa87-private.pem
+
+      - name: Upload PQC payload evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sovereignty-pqc-payload-${{ github.run_id }}
+          path: |
+            sovereignty-pqc-payload.json
+            sovereignty-pqc-payload.sig
+            mldsa87-public.pem
+          if-no-files-found: error
+          retention-days: 90
